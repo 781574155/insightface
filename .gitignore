@@ -120,3 +120,5 @@ server/test-results/
 
 .DS_Store
 ._*
+
+.idea/

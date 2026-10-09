@@ -334,10 +334,8 @@ def test_strict_registration_identity_rejection_preserves_liveness(
             ("images", ("tie.png", sample, "image/png")),
         ],
     )
-    assert response.status_code == 201, response.text
-    assert len(response.json()["faces"]) == 1
-    assert response.json()["faces"][0]["liveness"] == INPUT_REJECTED
-    rejected = response.json()["rejected_images"][0]
+    assert response.status_code == 422, response.text
+    rejected = response.json()["error"]["details"]["rejected_images"][0]
     assert rejected["reason"] == "identity_similarity_conflict"
     assert rejected["liveness"] == INPUT_REJECTED
 

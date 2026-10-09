@@ -967,7 +967,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def create_person(
         request: Request,
         collection_id: str,
-        images: list[UploadFile] = File(...),
+        images: list[UploadFile] | None = File(default=None),
         id: str | None = Form(default=None),
         name: str | None = Form(default=None, max_length=200),
         external_id: str | None = Form(default=None, max_length=200),
@@ -977,7 +977,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         external_embeddings: str | None = Form(default=None),
         embedding_contract_id: str | None = Form(default=None, max_length=256),
     ):
-        """Register a person from one or more images, allowing partial success.
+        """Create a person, optionally enrolling images with partial success.
+
+        Omitting images creates a Person with no FaceSamples. Images can be
+        added later through the person's faces endpoint. Review and liveness
+        checks apply only when images are supplied.
 
         Liveness is skipped by default (liveness_on_registration=false), and new
         samples omit liveness. When enabled in server.toml, normal mode rejects
@@ -997,8 +1001,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             person_id = validate_id(id) if id else str(uuid.uuid4())
         except ValueError as exc:
             raise bad_request(str(exc), code="invalid_person_id") from exc
-        if not images:
-            raise bad_request("At least one image is required.")
+        images = images or []
         if len(images) > configured.max_registration_images:
             raise bad_request(
                 f"At most {configured.max_registration_images} images may be registered at once.",
@@ -1024,7 +1027,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     },
                 )
         loaded, indices, invalid = await load_images(images)
-        if not loaded:
+        if images and not loaded:
             raise unprocessable(
                 "None of the uploaded images were valid.",
                 code="registration_failed",
@@ -1147,12 +1150,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         collection_id: str,
         person_id: str,
         images: list[UploadFile] = File(...),
+        id: str | None = Form(default=None),
         review_mode: ReviewMode = Form(default="off"),
         embedding_mode: EmbeddingMode = Form(default="server"),
         external_embeddings: str | None = Form(default=None),
         embedding_contract_id: str | None = Form(default=None, max_length=256),
     ):
         """Add images to an existing person, allowing partial success.
+
+        An optional id specifies the FaceSample ID for a single uploaded image.
+        IDs must be globally unique and follow the Person ID format. Omit id
+        to generate a UUID for each accepted sample. An existing ID returns 409.
 
         Liveness is skipped by default (liveness_on_registration=false). When
         enabled, normal mode rejects fake or unsuitable images with reason
@@ -1166,6 +1174,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         samples omit it. Model faults return HTTP 503 liveness_unavailable.
         """
         await authorize(request)
+        if id is not None and len(images) != 1:
+            raise bad_request(
+                "A FaceSample ID can only be specified with exactly one image.",
+                code="face_id_requires_single_image",
+            )
         if len(images) > configured.max_registration_images:
             raise bad_request(
                 f"At most {configured.max_registration_images} images may be registered at once.",
@@ -1201,6 +1214,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             collection_id,
             person_id,
             loaded,
+            face_id=id,
             review_mode=review_mode,
             embedding_mode=embedding_mode,
             external_embeddings=loaded_embeddings,

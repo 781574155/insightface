@@ -27,6 +27,25 @@ def _trusted_data(
     }
 
 
+def test_external_trusted_add_faces_accepts_string_id(
+    client: TestClient, create_collection, image_bytes
+) -> None:
+    collection = create_collection(client)
+    assert client.post("/v1/collections/employees/persons", data={"id": "alice"}).status_code == 201
+    response = client.post(
+        "/v1/collections/employees/persons/alice/faces",
+        data=_trusted_data(
+            str(collection["embedding_contract_id"]),
+            [_unit_vector(int(collection["embedding_dimension"]))],
+            id="upstream-face-001",
+        ),
+        files={"images": ("alice.png", image_bytes(102), "image/png")},
+    )
+    assert response.status_code == 201, response.text
+    assert response.json()["faces"][0]["id"] == "upstream-face-001"
+    assert response.json()["faces"][0]["embedding_source"] == "external_trusted"
+
+
 def test_external_trusted_skips_recognizer_persists_and_indexes_supplied_vector(
     client: TestClient,
     create_collection,

@@ -4,6 +4,7 @@ import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from threading import Event, Lock
+from uuid import UUID
 
 import pytest
 from fastapi.testclient import TestClient
@@ -379,6 +380,101 @@ def test_collection_capacity_is_a_hard_409_and_does_not_commit_extra_face(
     assert len(faces.json()["faces"]) == 1
 
 
+@pytest.mark.parametrize("review_mode", ["off", "standard", "strict"])
+def test_person_registration_without_images_can_enroll_faces_later(
+    client: TestClient, create_collection, image_bytes, monkeypatch, review_mode: str
+) -> None:
+    collection = create_collection(client)
+
+    def unexpected_work(*args, **kwargs):
+        pytest.fail("Creating a Person without images must not use inference or search")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(client.app.state.engine, "analyze", unexpected_work)
+        patch.setattr(client.app.state.search_indexes, "run_mutation", unexpected_work)
+        created = client.post(
+            "/v1/collections/employees/persons",
+            data={
+                "id": "alice",
+                "name": "Alice",
+                "external_id": "HR-1001",
+                "metadata": '{"department":"sales"}',
+                "review_mode": review_mode,
+            },
+        )
+
+    assert created.status_code == 201, created.text
+    body = created.json()
+    assert body["person"]["face_count"] == 0
+    assert body["person"]["name"] == "Alice"
+    assert body["person"]["external_id"] == "HR-1001"
+    assert body["person"]["metadata"] == {"department": "sales"}
+    assert body["faces"] == body["rejected_images"] == []
+    people = client.get("/v1/collections/employees/persons").json()["persons"]
+    assert [person["id"] for person in people] == ["alice"]
+    assert client.get("/v1/collections/employees/persons/alice/faces").json()["faces"] == []
+    persisted = client.get("/v1/collections/employees").json()["collection"]
+    assert persisted["person_count"] == 1
+    assert persisted["face_count"] == 0
+    assert persisted["search_revision"] == collection["search_revision"]
+
+    sample = image_bytes(102)
+    added = client.post(
+        "/v1/collections/employees/persons/alice/faces",
+        data={"review_mode": review_mode},
+        files={"images": ("alice.png", sample, "image/png")},
+    )
+    assert added.status_code == 201, added.text
+    assert len(added.json()["faces"]) == 1
+    assert client.get("/v1/collections/employees/persons/alice").json()["person"]["face_count"] == 1
+    found = client.post(
+        "/v1/collections/employees/search",
+        files={"image": ("query.png", sample, "image/png")},
+    )
+    assert found.status_code == 200, found.text
+    assert found.json()["matches"][0]["person"]["id"] == "alice"
+
+
+def test_person_registration_without_images_keeps_validation_and_uniqueness(
+    client: TestClient, create_collection
+) -> None:
+    create_collection(client)
+    path = "/v1/collections/employees/persons"
+    created = client.post(path, data={"id": "alice", "external_id": "HR-1001"})
+    assert created.status_code == 201, created.text
+    for data in (
+        {"id": "alice"},
+        {"id": "bob", "external_id": "HR-1001"},
+    ):
+        duplicate = client.post(path, data=data)
+        assert duplicate.status_code == 409
+        assert duplicate.json()["error"]["code"] == "person_exists"
+    invalid = client.post(path, data={"id": "bad-metadata", "metadata": "[]"})
+    assert invalid.status_code == 400
+    assert invalid.json()["error"]["code"] == "invalid_metadata"
+    assert client.get(path + "/bad-metadata").status_code == 404
+    missing = client.post("/v1/collections/missing/persons", data={"id": "bob"})
+    assert missing.status_code == 404
+    generated = client.post(path)
+    assert generated.status_code == 201, generated.text
+    assert generated.json()["person"]["id"]
+    assert generated.json()["person"]["face_count"] == 0
+
+
+def test_person_registration_with_only_invalid_images_does_not_create_person(
+    client: TestClient, create_collection
+) -> None:
+    create_collection(client)
+    response = client.post(
+        "/v1/collections/employees/persons",
+        data={"id": "invalid-image"},
+        files={"images": ("invalid.png", b"not-an-image", "image/png")},
+    )
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "registration_failed"
+    assert client.get("/v1/collections/employees/persons/invalid-image").status_code == 404
+
+
 def test_person_registration_supports_partial_success(
     client: TestClient, create_collection, image_bytes
 ) -> None:
@@ -488,6 +584,8 @@ def test_strict_review_bootstraps_then_rejects_profile_similarity_tie(
     def tied_other(collection_id, _query, *, exclude_person_id):
         nonlocal calls
         calls += 1
+        if calls == 1:
+            return None
         assert collection_id == "employees"
         assert exclude_person_id == "alice"
         return {
@@ -502,6 +600,9 @@ def test_strict_review_bootstraps_then_rejects_profile_similarity_tie(
         tied_other,
         raising=False,
     )
+    monkeypatch.setattr(
+        "insightface_server.services.core.profile_similarity", lambda *_args: 1.0
+    )
     sample = image_bytes(102)
     response = client.post(
         "/v1/collections/employees/persons",
@@ -515,7 +616,7 @@ def test_strict_review_bootstraps_then_rejects_profile_similarity_tie(
     assert response.status_code == 201, response.text
     body = response.json()
     assert len(body["faces"]) == 1
-    assert calls == 1
+    assert calls == 2
     assert body["rejected_images"] == [
         {
             "index": 1,
@@ -611,6 +712,152 @@ def test_registration_all_fail_is_422_with_reasons(
         "face_not_found",
         "multiple_faces",
     }
+
+
+@pytest.mark.parametrize("review_mode", ["off", "standard", "strict"])
+def test_add_faces_with_string_id_supports_listing_search_and_deletion(
+    client: TestClient, create_collection, image_bytes, review_mode: str
+) -> None:
+    create_collection(client)
+    path = "/v1/collections/employees/persons/alice"
+    assert client.post("/v1/collections/employees/persons", data={"id": "alice"}).status_code == 201
+    sample = image_bytes(102)
+    face_id = "portrait-001.A_2"
+    added = client.post(
+        path + "/faces",
+        data={"id": face_id, "review_mode": review_mode},
+        files={"images": ("alice.png", sample, "image/png")},
+    )
+    assert added.status_code == 201, added.text
+    assert [face["id"] for face in added.json()["faces"]] == [face_id]
+    assert added.json()["rejected_images"] == []
+    assert [face["id"] for face in client.get(path + "/faces").json()["faces"]] == [face_id]
+    found = client.post(
+        "/v1/collections/employees/search",
+        files={"image": ("query.png", sample, "image/png")},
+    )
+    assert found.status_code == 200, found.text
+    assert found.json()["matches"][0]["matched_face_id"] == face_id
+    assert client.delete(path + "/faces/" + face_id).status_code == 204
+    assert client.get(path).json()["person"]["face_count"] == 0
+    found = client.post(
+        "/v1/collections/employees/search",
+        files={"image": ("query.png", sample, "image/png")},
+    )
+    assert found.status_code == 200, found.text
+    assert found.json()["matches"] == []
+
+
+def test_add_faces_without_id_still_generates_distinct_uuids(
+    client: TestClient, create_collection, image_bytes
+) -> None:
+    create_collection(client)
+    assert client.post("/v1/collections/employees/persons", data={"id": "alice"}).status_code == 201
+    added = client.post(
+        "/v1/collections/employees/persons/alice/faces",
+        files=[
+            ("images", ("one.png", image_bytes(101), "image/png")),
+            ("images", ("two.png", image_bytes(102), "image/png")),
+        ],
+    )
+    assert added.status_code == 201, added.text
+    ids = [face["id"] for face in added.json()["faces"]]
+    assert len(set(ids)) == 2
+    assert all(UUID(face_id).version == 4 for face_id in ids)
+
+
+@pytest.mark.parametrize("target", [("employees", "alice"), ("employees", "bob"), ("visitors", "bob")])
+def test_add_faces_rejects_globally_duplicate_id_without_changing_samples(
+    client: TestClient, create_collection, image_bytes, target
+) -> None:
+    for collection_id in ("employees", "visitors"):
+        create_collection(client, collection_id)
+        for person_id in ("alice", "bob"):
+            assert client.post(
+                f"/v1/collections/{collection_id}/persons", data={"id": person_id}
+            ).status_code == 201
+    added = client.post(
+        "/v1/collections/employees/persons/alice/faces",
+        data={"id": "shared-face"},
+        files={"images": ("alice.png", image_bytes(102), "image/png")},
+    )
+    assert added.status_code == 201, added.text
+    collection_id, person_id = target
+    before = client.get(f"/v1/collections/{collection_id}").json()["collection"]
+    duplicate = client.post(
+        f"/v1/collections/{collection_id}/persons/{person_id}/faces",
+        data={"id": "shared-face"},
+        files={"images": ("other.png", image_bytes(103), "image/png")},
+    )
+    assert duplicate.status_code == 409, duplicate.text
+    assert duplicate.json()["error"]["code"] == "face_exists"
+    after = client.get(f"/v1/collections/{collection_id}").json()["collection"]
+    assert after["face_count"] == before["face_count"]
+    assert after["search_revision"] == before["search_revision"]
+    faces = client.get("/v1/collections/employees/persons/alice/faces").json()["faces"]
+    assert [face["id"] for face in faces] == ["shared-face"]
+
+
+@pytest.mark.parametrize("face_id", ["bad id", "../face", "a" * 65])
+def test_add_faces_rejects_invalid_string_id_before_inference(
+    client: TestClient, create_collection, image_bytes, monkeypatch, face_id: str
+) -> None:
+    create_collection(client)
+    assert client.post("/v1/collections/employees/persons", data={"id": "alice"}).status_code == 201
+
+    def unexpected_inference(*args, **kwargs):
+        pytest.fail("An invalid FaceSample ID must be rejected before inference")
+
+    monkeypatch.setattr(client.app.state.engine, "analyze", unexpected_inference)
+    response = client.post(
+        "/v1/collections/employees/persons/alice/faces",
+        data={"id": face_id},
+        files={"images": ("alice.png", image_bytes(102), "image/png")},
+    )
+    assert response.status_code == 400, response.text
+    assert response.json()["error"]["code"] == "invalid_face_id"
+
+
+def test_add_faces_with_id_rejects_multiple_original_image_parts(
+    client: TestClient, create_collection, image_bytes
+) -> None:
+    create_collection(client)
+    assert client.post("/v1/collections/employees/persons", data={"id": "alice"}).status_code == 201
+    response = client.post(
+        "/v1/collections/employees/persons/alice/faces",
+        data={"id": "portrait-001"},
+        files=[
+            ("images", ("invalid.png", b"not-an-image", "image/png")),
+            ("images", ("alice.png", image_bytes(102), "image/png")),
+        ],
+    )
+    assert response.status_code == 400, response.text
+    assert response.json()["error"]["code"] == "face_id_requires_single_image"
+    assert client.get("/v1/collections/employees/persons/alice").json()["person"]["face_count"] == 0
+
+
+@pytest.mark.parametrize("invalid_image", [True, False])
+def test_add_faces_rejected_image_does_not_reserve_supplied_id(
+    client: TestClient, create_collection, image_bytes, invalid_image: bool
+) -> None:
+    create_collection(client)
+    assert client.post("/v1/collections/employees/persons", data={"id": "alice"}).status_code == 201
+    path = "/v1/collections/employees/persons/alice/faces"
+    rejected = client.post(
+        path,
+        data={"id": "portrait-001"},
+        files={"images": ("rejected.png", b"not-an-image" if invalid_image else image_bytes(blank=True), "image/png")},
+    )
+    assert rejected.status_code == 201, rejected.text
+    assert rejected.json()["faces"] == []
+    assert len(rejected.json()["rejected_images"]) == 1
+    retried = client.post(
+        path,
+        data={"id": "portrait-001"},
+        files={"images": ("alice.png", image_bytes(102), "image/png")},
+    )
+    assert retried.status_code == 201, retried.text
+    assert retried.json()["faces"][0]["id"] == "portrait-001"
 
 
 def test_person_and_face_crud(
@@ -765,3 +1012,37 @@ def test_configured_default_threshold_is_used(
 
     assert collection.json()["collection"]["default_threshold"] == 0.73
     assert compared.json()["threshold"] == 0.73
+
+
+@pytest.mark.parametrize("similarity,accepted", [(0.399, True), (0.4, False), (0.401, False)])
+def test_strict_first_face_uses_collection_threshold(client, create_collection, image_bytes, monkeypatch, similarity, accepted):
+    create_collection(client, threshold=0.4)
+    client.post("/v1/collections/employees/persons", data={"id": "alice"})
+    monkeypatch.setattr(client.app.state.search_indexes, "best_other_person", lambda *a, **kw: {
+        "person_id": "bob", "face_id": "bob-face", "similarity": similarity,
+    })
+    response = client.post("/v1/collections/employees/persons/alice/faces",
+        data={"review_mode": "strict"}, files={"images": ("face.png", image_bytes(102), "image/png")})
+    assert response.status_code == 201, response.text
+    assert len(response.json()["faces"]) == int(accepted)
+    assert client.get("/v1/collections/employees/persons/alice").json()["person"]["face_count"] == int(accepted)
+    if not accepted:
+        rejected = response.json()["rejected_images"][0]
+        assert rejected["reason"] == "identity_similarity_conflict"
+        assert rejected["other_person_id"] == "bob"
+        assert rejected["same_person_similarity"] is None
+
+
+def test_strict_first_face_rejects_existing_person_image(client, create_collection, create_person, image_bytes):
+    create_collection(client)
+    create_person(client, "employees", "bob", seed=102)
+    client.post("/v1/collections/employees/persons", data={"id": "alice"})
+    upload = {"images": ("same.png", image_bytes(102), "image/png")}
+    added = client.post("/v1/collections/employees/persons/alice/faces", data={"review_mode": "strict"}, files=upload)
+    assert added.status_code == 201, added.text
+    assert added.json()["faces"] == []
+    assert added.json()["rejected_images"][0]["other_person_id"] == "bob"
+    created = client.post("/v1/collections/employees/persons", data={"id": "charlie", "review_mode": "strict"}, files=upload)
+    assert created.status_code == 422, created.text
+    assert created.json()["error"]["code"] == "registration_failed"
+    assert client.get("/v1/collections/employees/persons/charlie").status_code == 404

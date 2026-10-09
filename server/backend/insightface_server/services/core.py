@@ -8,7 +8,7 @@ from typing import Any
 import numpy as np
 
 from ..addons import LivenessUnavailable
-from ..api.schemas import EmbeddingMode, ReviewMode
+from ..api.schemas import EmbeddingMode, ReviewMode, validate_id
 from ..config import DetectionProfile, Settings
 from ..errors import ApiError, bad_request, conflict, not_found, unprocessable
 from ..inference import FaceObservation, InferenceEngine
@@ -545,15 +545,9 @@ class FaceService:
         profile = str(collection["search_profile"])
         for face in faces:
             embedding = np.asarray(face["embedding"], dtype=np.float32)
-            # The first usable sample bootstraps an empty Person. Samples later in
-            # this same multipart request can use it as a class-in reference.
-            if not same_embeddings:
-                accepted.append(face)
-                same_embeddings.append(embedding)
-                continue
-
-            max_same = max(
-                profile_similarity(profile, embedding, reference) for reference in same_embeddings
+            max_same = (
+                max(profile_similarity(profile, embedding, reference) for reference in same_embeddings)
+                if same_embeddings else None
             )
             try:
                 other = self.search_indexes.best_other_person(
@@ -564,14 +558,17 @@ class FaceService:
             except SearchIndexError as exc:
                 raise self._search_unavailable(exc) from exc
 
-            if other is not None and max_same <= float(other["similarity"]):
+            if other is not None and (
+                float(other["similarity"]) >= float(collection["default_threshold"])
+                if max_same is None else max_same <= float(other["similarity"])
+            ):
                 self._delete_crop_paths([face.get("crop_path")])
                 rejected.append(
                     {
                         "index": int(face["_registration_index"]),
                         "filename": str(face["_registration_filename"]),
                         "reason": "identity_similarity_conflict",
-                        "same_person_similarity": float(max_same),
+                        "same_person_similarity": float(max_same) if max_same is not None else None,
                         "other_person_similarity": float(other["similarity"]),
                         "other_person_id": str(other["person_id"]),
                         "matched_face_id": str(other["face_id"]),
@@ -624,23 +621,39 @@ class FaceService:
         external_embeddings: list[Any] | None = None,
         embedding_contract_id: str | None = None,
     ) -> tuple[dict[str, Any], list[dict[str, Any]], list[dict[str, Any]]]:
-        collection = self.collection(collection_id)
-        faces, rejected = self.prepare_registration(
-            collection,
-            images,
-            review_mode=review_mode,
-            embedding_mode=embedding_mode,
-            external_embeddings=external_embeddings,
-            embedding_contract_id=embedding_contract_id,
+        collection = (
+            self.collection(collection_id) if images else self.raw_collection(collection_id)
         )
-        if not faces:
+        if images:
+            faces, rejected = self.prepare_registration(
+                collection,
+                images,
+                review_mode=review_mode,
+                embedding_mode=embedding_mode,
+                external_embeddings=external_embeddings,
+                embedding_contract_id=embedding_contract_id,
+            )
+        else:
+            self._validate_embedding_mode(
+                collection,
+                embedding_mode=embedding_mode,
+                external_embeddings=external_embeddings,
+                embedding_contract_id=embedding_contract_id,
+                image_count=0,
+            )
+            faces, rejected = [], []
+        if images and not faces:
             raise unprocessable(
                 "None of the uploaded images contained one registrable face.",
                 code="registration_failed",
                 rejected_images=rejected,
             )
         try:
-            if review_mode == "strict":
+            if not images:
+                created, _ = self.repository.create_person_with_faces_with_mutation(
+                    collection_id, person, []
+                )
+            elif review_mode == "strict":
                 # Keep the identity decision and write under one Collection
                 # lock, so another enrollment cannot change the class-out
                 # maximum between review and commit.
@@ -648,6 +661,12 @@ class FaceService:
                     reviewed, strict_rejected = self._strict_registration_review(
                         collection, str(person["id"]), faces, []
                     )
+                    if not reviewed:
+                        raise unprocessable(
+                            "None of the uploaded images passed identity review.",
+                            code="registration_failed",
+                            rejected_images=rejected + strict_rejected,
+                        )
                     created_item, mutation = self.repository.create_person_with_faces_with_mutation(
                         collection_id, person, reviewed
                     )
@@ -699,11 +718,22 @@ class FaceService:
         person_id: str,
         images: list[ImageData],
         *,
+        face_id: str | None = None,
         review_mode: ReviewMode = "off",
         embedding_mode: EmbeddingMode = "server",
         external_embeddings: list[Any] | None = None,
         embedding_contract_id: str | None = None,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        if face_id is not None:
+            try:
+                validate_id(face_id)
+            except ValueError as exc:
+                raise bad_request(str(exc), code="invalid_face_id") from exc
+            if len(images) > 1:
+                raise bad_request(
+                    "A FaceSample ID can only be specified with exactly one image.",
+                    code="face_id_requires_single_image",
+                )
         collection = self.collection(collection_id)
         if self.repository.get_person(collection_id, person_id) is None:
             raise not_found("person", person_id)
@@ -716,6 +746,8 @@ class FaceService:
             embedding_contract_id=embedding_contract_id,
         )
         if faces:
+            if face_id is not None:
+                faces[0]["id"] = face_id
             try:
                 if review_mode == "strict":
 
@@ -768,6 +800,16 @@ class FaceService:
             except SearchIndexError as exc:
                 self._delete_crop_paths([face.get("crop_path") for face in faces])
                 raise self._search_unavailable(exc) from exc
+            except sqlite3.IntegrityError as exc:
+                self._delete_crop_paths([face.get("crop_path") for face in faces])
+                if exc.sqlite_errorcode in (
+                    sqlite3.SQLITE_CONSTRAINT_PRIMARYKEY,
+                    sqlite3.SQLITE_CONSTRAINT_UNIQUE,
+                ):
+                    raise conflict(
+                        "The FaceSample ID already exists.", code="face_exists"
+                    ) from exc
+                raise
             except Exception:
                 self._delete_crop_paths([face.get("crop_path") for face in faces])
                 raise

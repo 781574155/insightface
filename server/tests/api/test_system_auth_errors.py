@@ -316,8 +316,10 @@ def test_openapi_documents_enrollment_review_modes(client: TestClient) -> None:
             "multipart/form-data"
         ]["schema"]
         reference = request_schema["$ref"].rsplit("/", 1)[-1]
-        review = schema["components"]["schemas"][reference]["properties"][
-            "review_mode"
-        ]
+        body_schema = schema["components"]["schemas"][reference]
+        review = body_schema["properties"]["review_mode"]
         assert review["enum"] == ["off", "standard", "strict"]
         assert review["default"] == "off"
+        assert ("images" in body_schema.get("required", [])) == path.endswith("/faces")
+        assert "id" in body_schema["properties"]
+        assert "id" not in body_schema.get("required", [])
